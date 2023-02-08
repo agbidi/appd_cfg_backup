@@ -6,12 +6,13 @@
 # author            : Alexander Agbidinoukoun
 # email             : aagbidin@cisco.com
 # date              : 20230124
-# version           : 0.1
-# usage             : ./cfgbackuper.sh -c config.cfg -m export|import
+# version           : 0.3
+# usage             : ./appd_cfg_backup.sh [-h] [-v] [-r "command"] -m export|import -c config_file
 # notes             : 
 #   0.1: first release
 #   0.2: added oauth token authentication; added -r option to start the config exporter automatically
-
+#   0.3: added dashboard exports + bug fixes
+# 
 #==============================================================================
 
 
@@ -30,7 +31,7 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd -P)
 log_file=$(echo ${BASH_SOURCE[0]} | sed 's/sh$/log/')
 timestamp=$(date +%Y%m%d%H%M%S)
 run_wait=10 # time to wait after running the config exporter
-output_dir_name='name' # id|name
+output_name_mode='name' # id|name
 
 usage() {
   cat << EOF
@@ -135,34 +136,32 @@ parse_params "$@"
 cleanup() {
   trap - SIGINT SIGTERM EXIT
   # stop config exporter
-  [ ! -z "${run-}" ] && kill $pid
+  [ ! -z "${pid-}" ] && info "Stopping Config Exporter (pid = $pid)." && kill $pid
+  # delete temporary file
+  info "Cleaning up temporary files" 
+  [ ! -z "${appd_cookie_path-}" ] && rm $appd_cookie_path
+  info "Done."
 }
 
 
 my_curl() {
   auth=$1; shift
-  #reset IFS to original value
 
-  PREV_PREV_IFS=$PREV_IFS
-  PREV_IFS=$IFS
-  IFS=$PREV_PREV_IFS 
+  x_csrf_header=''
+  [ ! -z "${x_csrf_token-}" ] && x_csrf_header="-H X-CSRF-TOKEN:$x_csrf_token"
 
   if [ "$auth" == "true" -a ! -z "$appd_oauth_token" ]; then
     curl -s -H "Authorization:Bearer $appd_oauth_token" $appd_proxy "$@"
   elif [ "$auth" == "true" ]; then
-    curl -s -u "${appd_api_user}@${appd_account}:${appd_api_password}" ${appd_proxy} "$@"
+    curl -s -u "${appd_api_user}@${appd_account}:${appd_api_password}" ${appd_proxy} --cookie $appd_cookie_path $x_csrf_header "$@"
   else
     curl -s "$@"
   fi
-
-  IFS=$PREV_IFS
-  PREV_IFS=$PREV_PREV_IFS
 }
 
 get_appd_oauth_token() {
 
   # curl request
-
   response=`my_curl true -X POST -H "Content-Type: application/vnd.appd.cntrl+protobuf;v=1" \
   -d "grant_type=client_credentials&client_id=${appd_api_user}@${appd_account}&client_secret=${appd_api_secret}" \
   ${appd_url}/controller/api/oauth/access_token`
@@ -174,14 +173,28 @@ get_appd_oauth_token() {
   echo -n $response | sed 's/[[:blank:]]//g' | sed -E 's/^.*"access_token":"([^"]*)".*$/\1/'
 }
 
-get_applications_info() {
-  regex=$1
-  response=`my_curl true "${appd_url}/controller/rest/applications?output=json"`
+get_appd_cookie() {
+  # curl request
+  my_curl true --cookie-jar $appd_cookie_path ${appd_url}/controller/auth?action=login
+  
+  x_csrf_token="`grep X-CSRF-TOKEN $appd_cookie_path | sed 's/^.*X-CSRF-TOKEN[[:blank:]]*\(.*\)$/\1/'`"
+
+  # validate response
+  [ -z "$x_csrf_token" ] && warn "Could not retrieve AppDynamics login cookie"
+}
+
+get_entities_info() {
+
+  url=$1
+  regex=$2
+  response=`my_curl true $url`
   infos=`jq -r ".[] | select(.name | test(\"$regex\")) | .name,.id" <<<$response`
 
   app_infos=""
   last_info='id'
 
+  PREV_IFS=$IFS
+  IFS=$'\n'
   for info in ${infos}; do
     if [ `echo ${info} | grep -E '^[0-9]+$'` ] ; then  # app id
       app_infos+="=${info},"
@@ -195,14 +208,53 @@ get_applications_info() {
       last_info='name'
     fi
   done
+  IFS=$PREV_IFS
 
   echo -n ${app_infos}
 }
 
-validate_config_output() {
-  file=$1
-  grep controllerUrl $file > /dev/null 2>&1
-  return $?
+get_applications_info() {
+  get_entities_info "${appd_url}/controller/rest/applications?output=json" "$appd_application_names"
+}
+
+get_dashboards_info() {
+  get_entities_info "${appd_url}/controller/restui/dashboards/getAllDashboardsByType/false" "$appd_dashboard_names"
+}
+
+export_dashboard() {
+  name=$1
+  id=$2
+  
+  [ $output_name_mode == "name" ] && output_file=${output_dir}/dashboards/${name}.json || output_file=${output_dir}/dashboards/${id}.json
+  
+  info "Exporting dashboard ${name}"
+  my_curl true -o "${output_file}" "${appd_url}/CustomDashboardImportExportServlet?dashboardId=${id}"
+}
+
+export_dashboards() {
+
+  info "*** Exporting dashboards"
+
+  mkdir ${output_dir}/dashboards
+
+  # retrieve dashboard names & ids from dashboard regex
+  info "Retrieving AppDynamics dashboards details"
+  dashboards_info=`get_dashboards_info`
+  info "Matched dashboards: $dashboards_info"
+
+  # loop over all dashboards
+  PREV_IFS=$IFS
+  IFS=','
+  for info in ${dashboards_info}; do
+    IFS=$PREV_IFS
+    name=`echo ${info} | cut -d '=' -f 1`
+    id=`echo ${info} | cut -d '=' -f 2`
+    export_dashboard "$name" $id
+    IFS=','
+  done
+  IFS=$PREV_IFS
+
+  return 0
 }
 
 export_config_entity() {
@@ -210,33 +262,40 @@ export_config_entity() {
   id=$2
   entity=$3
   
-  [ $output_dir_name == "name" ] && output_file=${output_dir}/${name}/${entity}.json || output_file=${output_dir}/${id}/${entity}.json
+  [ $output_name_mode == "name" ] && output_file="${output_dir}/${name}/${entity}.json" || output_file="${output_dir}/${id}/${entity}.json"
 
   info "Exporting ${entity}"
-  my_curl false -o ${output_file} "${config_exporter_url}/api/controllers/${appd_id}/files/${entity}?applicationId=${id}"
+  my_curl false -o "${output_file}" "${config_exporter_url}/api/controllers/${appd_id}/files/${entity}?applicationId=${id}"
   
-  validate_config_output $output_file
+  validate_config_output "$output_file"
   [ $? -ne 0 ] && warn "There was an issue exporting ${entity} for application $name ($id)" && return 1
 
   return 0
 }
 
+validate_config_output() {
+  file=$1
+  grep controllerUrl "$file" > /dev/null 2>&1
+  return $?
+}
 
 export_account_config() {
 
   info "*** Exporting account level configuration"
-  # loop over all applications
+  
+  mkdir ${output_dir}/account
+
+  # loop over all account config
   PREV_IFS=$IFS
   IFS=','
-  id='account'
-  mkdir ${output_dir}/${id}
-  # loop over config entities
   for entity in ${appd_account_config}; do
+    IFS=$PREV_IFS
     if [ $entity == "dashboards" ]; then
-      warn "Dashboard exports not yet implemented"
+      export_dashboards
     else
-      export_config_entity $id $id $entity
+      export_config_entity account account $entity
     fi
+  IFS=','
   done 
   IFS=$PREV_IFS
 
@@ -244,27 +303,30 @@ export_account_config() {
 }
 
 export_application_config() {
-  # 
+  
   # retrieve application names & ids from application regex
   info "Retrieving AppDynamics application details"
-  applications_info=`get_applications_info ${appd_application_names}`; [ $? -ne 0 ]
+  applications_info=`get_applications_info`
   info "Matched applications: $applications_info"
 
   # loop over all applications
   PREV_IFS=$IFS
   IFS=','
   for info in ${applications_info}; do
-    # get alerting action id
+    IFS=$PREV_IFS
     name=`echo ${info} | cut -d '=' -f 1`
     id=`echo ${info} | cut -d '=' -f 2`
     info "*** Exporting configuration for application $name ($id)"
-    [ $output_dir_name == "name" ] && mkdir ${output_dir}/${name} || mkdir ${output_dir}/${id}
+    [ $output_name_mode == "name" ] && mkdir "${output_dir}/${name}" || mkdir ${output_dir}/${id}
 
     # loop over config entities
+    IFS=','
     for entity in ${appd_application_config}; do
-
-      export_config_entity $name $id $entity
+      IFS=$PREV_IFS
+      export_config_entity "$name" $id $entity
+      IFS=','
     done 
+    IFS=','
   done
   IFS=$PREV_IFS
 
@@ -291,6 +353,7 @@ init() {
   [ -z "${appd_api_user-}" ] && die "Missing required config entry: appd_api_user"
   [ -z "${appd_api_password-}" ] && [ -z "${appd_api_secret-}" ] && die "Missing required config entry: appd_api_password or appd_api_secret"
   [ -z "${appd_application_names-}" ] && die "Missing required config entry: appd_application_names"
+  [ -z "${appd_dashboard_names-}" ] && die "Missing required config entry: appd_dashboard_names"
   [ -z "${output_dir-}" ] && die "Missing required config entry: output_dir"
   [ -z "${appd_application_config-}" ] && [ -z "${appd_account_config-}" ] && die "Missing required config entry: appd_application_config or appd_account_config"
   [ -z "${config_exporter_url-}" ] && die "Missing required config entry: config_exporter_url"
@@ -303,22 +366,29 @@ init() {
   info "Using AppDynamics Source URL: ${appd_url-}"
   info "Using output directory: ${output_dir}"
   info "Using application name regex: ${appd_application_names}"
-
-  # retrieve appd token
-  appd_oauth_token=''
-  if [ "${appd_api_secret}" != "" ]; then
-    info "Retrieving AppDynamics oauth token at ${appd_url}"
-    appd_oauth_token=`get_appd_oauth_token`; [ $? -ne 0 ]
-  fi
+  info "Using dashboard name regex: ${appd_dashboard_names}"
 
   # create output dir if it does not exist
   if [ ! -d ${output_dir} ]; then 
     mkdir ${output_dir}
     [ $? -ne 0 ] && die "Could not create output directory: ${output_dir}"
   fi
+
   # create timestamp dir
   mkdir ${output_dir}/${timestamp}
   output_dir="${output_dir}/${timestamp}"
+
+  # retrieve appd token
+  appd_oauth_token=''
+  if [ "${appd_api_secret}" != "" ]; then
+    info "Retrieving AppDynamics oauth token at ${appd_url}"
+    appd_oauth_token=`get_appd_oauth_token`
+  fi
+  
+  # retrieve appd cookie and store it
+  appd_cookie_path=${output_dir}/.appd_cookie
+  info "Retrieving AppDynamics login cookie at ${appd_url}"
+  get_appd_cookie
 
   # launch config exporter
   if [ ! -z "${run-}" ]; then
