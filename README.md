@@ -17,7 +17,8 @@ Example:
 
 ./appd_cfg_backup.sh -m export -c appd_prod.cfg -r "java -jar /opt/tools/config_exporter/config-exporter-20.6.0.3.war"<br>
 
-Content of the config file:<br>
+Content of the config file:
+
 appd_url='http://account.saas.appdynamics.com:443' # appd controller url<br>
 appd_account='account' # appd account<br>
 appd_api_user='' # appd api username<br>
