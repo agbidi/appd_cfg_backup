@@ -378,6 +378,11 @@ init() {
   mkdir ${output_dir}/${timestamp}
   output_dir="${output_dir}/${timestamp}"
 
+  # retrieve appd cookie and store it
+  appd_cookie_path=${output_dir}/.appd_cookie
+  info "Retrieving AppDynamics login cookie at ${appd_url}"
+  get_appd_cookie
+
   # retrieve appd token
   appd_oauth_token=''
   if [ "${appd_api_secret}" != "" ]; then
@@ -385,11 +390,6 @@ init() {
     appd_oauth_token=`get_appd_oauth_token`
   fi
   
-  # retrieve appd cookie and store it
-  appd_cookie_path=${output_dir}/.appd_cookie
-  info "Retrieving AppDynamics login cookie at ${appd_url}"
-  get_appd_cookie
-
   # launch config exporter
   if [ ! -z "${run-}" ]; then
     info "Starting Config Exporter with command: ${run}"
